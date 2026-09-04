@@ -27,7 +27,7 @@ int g_failures = 0;
 
 void load_program(SM83 &c, uint16_t addr, const std::vector<uint8_t> &bytes) {
   for (size_t i = 0; i < bytes.size(); ++i) {
-    c.memory[(addr + i) & 0xFFFF] = bytes[i];
+    c.bus.write((addr + i) & 0xFFFF, bytes[i]);
   }
   c.reg_pc = addr;
 }
@@ -55,7 +55,7 @@ void test_subroutines() {
   CHECK(c.reg_sp == 0xFFFC);
   CHECK(c.total_cycles == 24);
   
-  c.memory[0x0020] = 0xC9; // RET (16 cycles)
+  c.bus.write(0x0020, 0xC9); // RET (16 cycles)
   c.execute();
   CHECK(c.reg_pc == 0x1003);
   CHECK(c.total_cycles == 40);
@@ -64,11 +64,11 @@ void test_subroutines() {
 void test_cb_timing() {
   SM83 c{};
   c.set_reg_hl(0x8000);
-  c.memory[0x8000] = 0x40;
+  c.bus.write(0x8000, 0x40);
   load_program(c, 0, {0xCB, 0x06}); // RLC (HL) (16 cycles)
   c.total_cycles = 0;
   c.execute();
-  CHECK(c.memory[0x8000] == 0x80 && c.total_cycles == 16);
+  CHECK(c.bus.read(0x8000) == 0x80 && c.total_cycles == 16);
 }
 
 void test_jr_timing() {
@@ -100,6 +100,115 @@ void test_interrupt_registers() {
   CHECK(c.read8(0xFF0F) == 0x04);
 }
 
+void test_bus_memory_map() {
+  Bus bus{};
+
+  // 1. Cartridge ROM area ($0000 - $7FFF)
+  bus.write(0x0000, 0x12);
+  bus.write(0x7FFF, 0x34);
+  CHECK(bus.read(0x0000) == 0x12);
+  CHECK(bus.read(0x7FFF) == 0x34);
+
+  // 2. Video RAM ($8000 - $9FFF)
+  bus.write(0x8000, 0xAA);
+  bus.write(0x9FFF, 0x55);
+  CHECK(bus.read(0x8000) == 0xAA);
+  CHECK(bus.read(0x9FFF) == 0x55);
+
+  // 3. External RAM ($A000 - $BFFF)
+  bus.write(0xA000, 0xBE);
+  bus.write(0xBFFF, 0xEF);
+  CHECK(bus.read(0xA000) == 0xBE);
+  CHECK(bus.read(0xBFFF) == 0xEF);
+
+  // 4. Work RAM ($C000 - $DFFF)
+  bus.write(0xC000, 0x42);
+  bus.write(0xDFFF, 0x99);
+  CHECK(bus.read(0xC000) == 0x42);
+  CHECK(bus.read(0xDFFF) == 0x99);
+
+  // 5. Echo RAM mirroring ($E000 - $FDFF mirrors $C000 - $DDFF)
+  // Writing to WRAM should be visible in Echo RAM
+  bus.write(0xC050, 0x77);
+  CHECK(bus.read(0xE050) == 0x77);
+
+  // Writing to Echo RAM should be visible in WRAM
+  bus.write(0xE100, 0x88);
+  CHECK(bus.read(0xC100) == 0x88);
+
+  // 6. Object Attribute Memory ($FE00 - $FE9F)
+  bus.write(0xFE00, 0x11);
+  bus.write(0xFE9F, 0x22);
+  CHECK(bus.read(0xFE00) == 0x11);
+  CHECK(bus.read(0xFE9F) == 0x22);
+
+  // 7. Unusable memory ($FEA0 - $FEFF)
+  bus.write(0xFEA0, 0x33);
+  CHECK(bus.read(0xFEA0) == 0xFF);
+
+  // 8. I/O Registers ($FF00 - $FF7F)
+  bus.write(0xFF00, 0x0F);
+  bus.write(0xFF40, 0x91); // LCDC
+  CHECK(bus.read(0xFF00) == 0x0F);
+  CHECK(bus.read(0xFF40) == 0x91);
+
+  // 9. High RAM / Zero Page ($FF80 - $FFFE)
+  bus.write(0xFF80, 0xAB);
+  bus.write(0xFFFE, 0xCD);
+  CHECK(bus.read(0xFF80) == 0xAB);
+  CHECK(bus.read(0xFFFE) == 0xCD);
+
+  // 10. Interrupt Enable ($FFFF)
+  bus.write(0xFFFF, 0x1F);
+  CHECK(bus.read(0xFFFF) == 0x1F);
+}
+
+void test_timer() {
+  Bus bus{};
+
+  // 1. DIV starts at 0 and increments every 256 cycles
+  CHECK(bus.read(0xFF04) == 0x00);
+  bus.tick(252);
+  CHECK(bus.read(0xFF04) == 0x00);
+  bus.tick(4);
+  CHECK(bus.read(0xFF04) == 0x01);
+
+  // 2. Writing any value to DIV resets it and its accumulator
+  bus.tick(200);
+  bus.write(0xFF04, 0xAB);
+  CHECK(bus.read(0xFF04) == 0x00);
+  bus.tick(255);
+  CHECK(bus.read(0xFF04) == 0x00);
+  bus.tick(1);
+  CHECK(bus.read(0xFF04) == 0x01);
+
+  // 3. TIMA does not count when TAC bit 2 is disabled
+  bus.write(0xFF05, 0x10); // TIMA = 0x10
+  bus.write(0xFF07, 0x01); // Rate: 16 cycles, but Enable bit 2 = 0
+  bus.tick(64);
+  CHECK(bus.read(0xFF05) == 0x10);
+
+  // 4. Enable TIMA at 16 cycles/tick (TAC = 0x05)
+  bus.write(0xFF07, 0x05); // Bit 2 (enable) | 01 (16 cycles)
+  bus.tick(16);
+  CHECK(bus.read(0xFF05) == 0x11);
+  bus.tick(32);
+  CHECK(bus.read(0xFF05) == 0x13);
+
+  // 5. TIMA overflow: reloads TMA and requests Timer interrupt (IF bit 2 = 0x04)
+  bus.write(0xFF06, 0x80); // TMA modulo reload = 0x80
+  bus.write(0xFF05, 0xFE); // TIMA = 0xFE
+  bus.write(0xFF0F, 0x00); // Clear interrupt flags
+
+  bus.tick(16); // TIMA: 0xFE -> 0xFF
+  CHECK(bus.read(0xFF05) == 0xFF);
+  CHECK((bus.read(0xFF0F) & 0x04) == 0);
+
+  bus.tick(16); // TIMA: 0xFF -> overflow -> reloads TMA (0x80) + requests interrupt
+  CHECK(bus.read(0xFF05) == 0x80);
+  CHECK((bus.read(0xFF0F) & 0x04) == 0x04);
+}
+
 } // namespace
 
 int main() {
@@ -108,6 +217,8 @@ int main() {
   test_cb_timing();
   test_jr_timing();
   test_interrupt_registers();
+  test_bus_memory_map();
+  test_timer();
 
   std::cout << "SM83 timing tests: " << g_checks << " checks, " << g_failures
             << " failures\n";

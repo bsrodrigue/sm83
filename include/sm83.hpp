@@ -1,560 +1,16 @@
+#pragma once
+#include "bus.hpp"
 #include <algorithm>
 #include <array>
-#include <cstddef>
 #include <cstdint>
-#include <fstream>
 #include <iomanip>
-#include <ios>
 #include <iostream>
-#include <stdexcept>
-#include <string>
 #include <vector>
-
-// GameBoy Memory Areas
-// $FFFF	Interrupt Enable Flag
-// $FF80-$FFFE	Zero Page - 127 bytes
-// $FF00-$FF7F	Hardware I/O Registers
-// $FEA0-$FEFF	Unusable Memory
-// $FE00-$FE9F	OAM - Object Attribute Memory
-// $E000-$FDFF	Echo RAM - Reserved, Do Not Use
-// $D000-$DFFF	Internal RAM - Bank 1-7 (switchable - CGB only)
-// $C000-$CFFF	Internal RAM - Bank 0 (fixed)
-// $A000-$BFFF	Cartridge RAM (If Available)
-// $9C00-$9FFF	BG Map Data 2
-// $9800-$9BFF	BG Map Data 1
-// $8000-$97FF	Character RAM
-// $4000-$7FFF	Cartridge ROM - Switchable Banks 1-xx
-// $0150-$3FFF	Cartridge ROM - Bank 0 (fixed)
-// $0100-$014F	Cartridge Header Area
-// $0000-$00FF	Restart and Interrupt Vectors
-
-// Hardware Components
-class InterruptController {
-public:
-  // Interrupt Flags ($FF0F) and Interrupt Enable ($FFFF)
-  // Bit 0: VBlank
-  // Bit 1: LCD STAT
-  // Bit 2: Timer
-  // Bit 3: Serial
-  // Bit 4: Joypad
-  uint8_t if_reg{0x00};
-  uint8_t ie_reg{0x00};
-
-  void request_interrupt(const uint8_t bit_mask) { if_reg |= bit_mask; }
-
-  uint8_t read_if() const { return if_reg; }
-  void write_if(const uint8_t val) { if_reg = val; }
-
-  uint8_t read_ie() const { return ie_reg; }
-  void write_ie(const uint8_t val) { ie_reg = val; }
-};
-
-class Joypad {
-public:
-  uint8_t joyp{0xCF}; // $FF00: Matrix select & button state
-
-  uint8_t read() const { return joyp; }
-  void write(const uint8_t val) {
-    // Bits 4 and 5 are writable selection lines (P14 / P15)
-    joyp = (joyp & 0x0F) | (val & 0x30);
-  }
-};
-
-class Serial {
-public:
-  uint8_t sb{0x00}; // $FF01: Serial data
-  uint8_t sc{0x7E}; // $FF02: Serial control
-
-  uint8_t read(const uint16_t addr) const {
-    if (addr == 0xFF01)
-      return sb;
-    if (addr == 0xFF02)
-      return sc;
-    return 0xFF;
-  }
-
-  void write(const uint16_t addr, const uint8_t val) {
-    if (addr == 0xFF01)
-      sb = val;
-    if (addr == 0xFF02)
-      sc = val;
-  }
-};
-
-class Timer {
-public:
-  static constexpr size_t MASTER_CLOCK_CYCLES = 256;
-
-  // Registers: $FF04-$FF07
-  uint8_t div{0x00};  // $FF04: Divider Register
-  uint8_t tima{0x00}; // $FF05: Timer Counter
-  uint8_t tma{0x00};  // $FF06: Timer Modulo
-  uint8_t tac{0x00};  // $FF07: Timer Control
-
-  uint64_t div_cycles = 0;
-  uint64_t tima_cycles = 0;
-
-  bool is_tac_enabled() {
-    const uint8_t bits = tac & 0x04;
-
-    return (bits != 0);
-  }
-
-  uint16_t get_tac_increment() {
-    const uint8_t bits = tac & 0x03;
-
-    if (bits == 0x00) {
-      return 1024;
-    } else if (bits == 0x01) {
-      return 16;
-    } else if (bits == 0x02) {
-      return 64;
-    } else if (bits == 0x03) {
-      return 256;
-    }
-
-    // Throw error here
-    return 0;
-  }
-
-  uint8_t read(const uint16_t addr) const {
-    switch (addr) {
-    case 0xFF04:
-      return div;
-    case 0xFF05:
-      return tima;
-    case 0xFF06:
-      return tma;
-    case 0xFF07:
-      return tac | 0xF8; // Upper 5 bits unused, return 1
-    default:
-      return 0xFF;
-    }
-  }
-
-  void write(const uint16_t addr, const uint8_t val) {
-    switch (addr) {
-    case 0xFF04:
-      // Any write resets DIV / internal counter
-      div = 0x00;
-      div_cycles = 0;
-      break;
-    case 0xFF05:
-      tima = val;
-      break;
-    case 0xFF06:
-      tma = val;
-      break;
-    case 0xFF07:
-      tac = val & 0x07;
-      break;
-    }
-  }
-
-  void tick(const int t_cycles, InterruptController &ic) {
-    div_cycles += t_cycles;
-
-    while (div_cycles >= MASTER_CLOCK_CYCLES) {
-      // Consume
-      div_cycles -= MASTER_CLOCK_CYCLES;
-
-      div++;
-    }
-
-    // Handle TIMA here ?
-    if (is_tac_enabled()) {
-      tima_cycles += t_cycles;
-      while (tima_cycles >= get_tac_increment()) {
-        // Consume
-        tima_cycles -= get_tac_increment();
-
-        // Check overflow and interrupt
-        if (tima == 0xFF) {
-          tima = tma;
-          // Interrupt
-          ic.request_interrupt(0x04);
-          continue;
-        }
-        tima++;
-      }
-    }
-  }
-};
-
-class APU {
-public:
-  std::array<uint8_t, 0x30> registers{}; // $FF10-$FF3F
-
-  uint8_t read(const uint16_t addr) const {
-    if (addr >= 0xFF10 && addr <= 0xFF3F) {
-      return registers[addr - 0xFF10];
-    }
-    return 0xFF;
-  }
-
-  void write(const uint16_t addr, const uint8_t val) {
-    if (addr >= 0xFF10 && addr <= 0xFF3F) {
-      registers[addr - 0xFF10] = val;
-    }
-  }
-};
-
-class PPU {
-public:
-  enum class Mode {
-    HBLANK,   // HBLANK (87-204 cycles)
-    VBLANK,   // VBLANK (4560 cycles)
-    OAM_SCAN, // OAM SCAN (80 cycles)
-    DRAW,     // DRAWING PIXELS (172-289 cycles)
-  };
-
-  static constexpr size_t VRAM_SIZE = 0x2000; // 8 KiB ($8000-$9FFF)
-  static constexpr size_t OAM_SIZE = 0x00A0;  // 160 bytes ($FE00-$FE9F)
-                                              //
-  static constexpr size_t SCANLINE_CYCLES = 456;
-
-  uint32_t total_cycles = 0;
-
-  std::array<uint8_t, VRAM_SIZE> vram{};
-  std::array<uint8_t, OAM_SIZE> oam{};
-
-  // I/O Registers ($FF40-$FF4B)
-  uint8_t lcdc{0x91}; // $FF40
-  uint8_t stat{0x85}; // $FF41
-  uint8_t scy{0x00};  // $FF42
-  uint8_t scx{0x00};  // $FF43
-  uint8_t ly{0x00};   // $FF44
-  uint8_t lyc{0x00};  // $FF45
-  uint8_t dma{0xFF};  // $FF46
-  uint8_t bgp{0xFC};  // $FF47
-  uint8_t obp0{0xFF}; // $FF48
-  uint8_t obp1{0xFF}; // $FF49
-  uint8_t wy{0x00};   // $FF4A
-  uint8_t wx{0x00};   // $FF4B
-
-  Mode get_mode() {
-    // Extract first two bits
-    const uint8_t bits = (stat & 0x03);
-
-    if (bits == 0x00) {
-      return Mode::HBLANK;
-    }
-
-    else if (bits == 0x01) {
-      return Mode::VBLANK;
-    }
-
-    else if (bits == 0x02) {
-      return Mode::OAM_SCAN;
-    }
-
-    else if (bits == 0x03) {
-      return Mode::DRAW;
-    }
-
-    // Better to throw exception here...
-    return Mode::OAM_SCAN;
-  }
-
-  void set_mode(const Mode mode) {
-    stat &= ~0x03; // Clear bits
-    stat |= static_cast<uint8_t>(mode);
-  }
-
-  uint8_t read(const uint16_t addr) const {
-    switch (addr) {
-    case 0xFF40:
-      return lcdc;
-    case 0xFF41:
-      return stat;
-    case 0xFF42:
-      return scy;
-    case 0xFF43:
-      return scx;
-    case 0xFF44:
-      return ly;
-    case 0xFF45:
-      return lyc;
-    case 0xFF46:
-      return dma;
-    case 0xFF47:
-      return bgp;
-    case 0xFF48:
-      return obp0;
-    case 0xFF49:
-      return obp1;
-    case 0xFF4A:
-      return wy;
-    case 0xFF4B:
-      return wx;
-    default:
-      return 0xFF;
-    }
-  }
-
-  void write(const uint16_t addr, const uint8_t val) {
-    switch (addr) {
-    case 0xFF40:
-      lcdc = val;
-      break;
-    case 0xFF41:
-      stat = (stat & 0x07) | (val & 0xF8);
-      break;
-    case 0xFF42:
-      scy = val;
-      break;
-    case 0xFF43:
-      scx = val;
-      break;
-    case 0xFF44: /* LY is read-only on DMG */
-      break;
-    case 0xFF45:
-      lyc = val;
-      break;
-    case 0xFF46:
-      dma = val;
-      break;
-    case 0xFF47:
-      bgp = val;
-      break;
-    case 0xFF48:
-      obp0 = val;
-      break;
-    case 0xFF49:
-      obp1 = val;
-      break;
-    case 0xFF4A:
-      wy = val;
-      break;
-    case 0xFF4B:
-      wx = val;
-      break;
-    }
-  }
-
-  uint8_t read_vram(const uint16_t addr) const { return vram[addr - 0x8000]; }
-  void write_vram(const uint16_t addr, const uint8_t val) {
-    vram[addr - 0x8000] = val;
-  }
-
-  uint8_t read_oam(const uint16_t addr) const { return oam[addr - 0xFE00]; }
-  void write_oam(const uint16_t addr, const uint8_t val) {
-    oam[addr - 0xFE00] = val;
-  }
-
-  void tick(const int t_cycles, InterruptController &ic) {
-    total_cycles += t_cycles;
-
-    if (total_cycles >= SCANLINE_CYCLES) { // Scanline boundary
-
-      // if (total_cycles <= 80) {
-      //
-      // }
-      // else if (total_cycles >= 172 && total_cycles <= 289) {
-      //
-      // }
-      // else if (total_cycles)
-
-      total_cycles -= SCANLINE_CYCLES; // Consume
-      ly++;
-      if ((ly >= 144) && (get_mode() != Mode::VBLANK)) { // VBLANK MODE
-        set_mode(Mode::VBLANK);
-        ic.request_interrupt(0x01);
-      }
-
-      if ((ly >= 154) && (get_mode() == Mode::VBLANK)) { // RESET
-        set_mode(Mode::OAM_SCAN);
-        ly = 0;
-      }
-    }
-  }
-
-  void draw() {
-    for (auto i = 0; i < 144; i++) {
-      // MODE 2
-      set_mode(Mode::OAM_SCAN);
-
-      // MODE 3
-      set_mode(Mode::DRAW);
-
-      // MODE 0
-      set_mode(Mode::HBLANK);
-    }
-
-    for (auto i = 144; i < 154; i++) {
-      // MODE 1
-      set_mode(Mode::VBLANK);
-    }
-  }
-};
-
-// The address bus is 16-bits wide, therefore 64KiB from 0x0000 to 0xFFFF
-class Bus {
-public:
-  // Memory region sizes
-  static constexpr size_t ROM_SIZE =
-      0x8000; // 32 KiB Cartridge ROM ($0000-$7FFF)
-  static constexpr size_t ERAM_SIZE =
-      0x2000; // 8 KiB External Cartridge RAM ($A000-$BFFF)
-  static constexpr size_t WRAM_SIZE = 0x2000; // 8 KiB Work RAM ($C000-$DFFF)
-  static constexpr size_t IO_SIZE =
-      0x0080; // 128 bytes I/O Registers ($FF00-$FF7F)
-  static constexpr size_t HRAM_SIZE =
-      0x007F; // 127 bytes High RAM ($FF80-$FFFE)
-
-  std::vector<uint8_t> rom;
-  std::array<uint8_t, ERAM_SIZE> eram{};
-  std::array<uint8_t, WRAM_SIZE> wram{};
-  std::array<uint8_t, IO_SIZE> io{};
-  std::array<uint8_t, HRAM_SIZE> hram{};
-
-  // Hardware subsystems
-  InterruptController interrupts;
-  Joypad joypad;
-  Serial serial;
-  Timer timer;
-  APU apu;
-  PPU ppu;
-
-  Bus() : rom(ROM_SIZE, 0) {}
-
-  void load_rom(const std::vector<uint8_t> &rom_buffer) {
-    if (rom_buffer.size() > rom.size()) {
-      rom.resize(rom_buffer.size());
-    }
-    std::copy(rom_buffer.begin(), rom_buffer.end(), rom.begin());
-  }
-
-  void tick(const int t_cycles) {
-    timer.tick(t_cycles, interrupts);
-    ppu.tick(t_cycles, interrupts);
-  }
-
-  uint8_t read(const uint16_t addr) const {
-    if (addr < 0x8000) { // Cartridge ROM ($0000 - $7FFF)
-      if (addr < rom.size()) {
-        // No cycle cost?
-        return rom[addr];
-      }
-      return 0xFF;
-    }
-    if (addr < 0xA000) { // VRAM ($8000 - $9FFF)
-      return ppu.read_vram(addr);
-    }
-    if (addr < 0xC000) { // External Cartridge RAM ($A000 - $BFFF)
-      return eram[addr - 0xA000];
-    }
-    if (addr < 0xE000) { // Work RAM ($C000 - $DFFF)
-      return wram[addr - 0xC000];
-    }
-    if (addr < 0xFE00) { // Echo RAM ($E000 - $FDFF, mirrors $C000 - $DDFF)
-      return wram[addr - 0xE000];
-    }
-    if (addr < 0xFEA0) { // OAM ($FE00 - $FE9F)
-      return ppu.read_oam(addr);
-    }
-    if (addr < 0xFF00) { // Unusable memory ($FEA0 - $FEFF)
-      return 0xFF;
-    }
-    // I/O Registers ($FF00 - $FF7F)
-    if (addr == 0xFF00) {
-      return joypad.read();
-    }
-    if (addr == 0xFF01 || addr == 0xFF02) {
-      return serial.read(addr);
-    }
-    if (addr >= 0xFF04 && addr <= 0xFF07) {
-      return timer.read(addr);
-    }
-    if (addr == 0xFF0F) {
-      return interrupts.read_if();
-    }
-    if (addr >= 0xFF10 && addr <= 0xFF3F) {
-      return apu.read(addr);
-    }
-    if (addr >= 0xFF40 && addr <= 0xFF4B) {
-      return ppu.read(addr);
-    }
-    if (addr < 0xFF80) {
-      return io[addr - 0xFF00];
-    }
-    if (addr < 0xFFFF) { // High RAM / Zero Page ($FF80 - $FFFE)
-      return hram[addr - 0xFF80];
-    }
-    return interrupts.read_ie(); // Interrupt Enable Register ($FFFF)
-  }
-
-  void write(const uint16_t addr, const uint8_t val) {
-    if (addr < 0x8000) { // Cartridge ROM ($0000 - $7FFF)
-      if (addr < rom.size()) {
-        rom[addr] = val;
-      }
-      return;
-    }
-    if (addr < 0xA000) { // VRAM ($8000 - $9FFF)
-      ppu.write_vram(addr, val);
-      return;
-    }
-    if (addr < 0xC000) { // External Cartridge RAM ($A000 - $BFFF)
-      eram[addr - 0xA000] = val;
-      return;
-    }
-    if (addr < 0xE000) { // Work RAM ($C000 - $DFFF)
-      wram[addr - 0xC000] = val;
-      return;
-    }
-    if (addr < 0xFE00) { // Echo RAM ($E000 - $FDFF, mirrors $C000 - $DDFF)
-      wram[addr - 0xE000] = val;
-      return;
-    }
-    if (addr < 0xFEA0) { // OAM ($FE00 - $FE9F)
-      ppu.write_oam(addr, val);
-      return;
-    }
-    if (addr < 0xFF00) { // Unusable memory ($FEA0 - $FEFF)
-      return;
-    }
-    // I/O Registers ($FF00 - $FF7F)
-    if (addr == 0xFF00) {
-      joypad.write(val);
-      return;
-    }
-    if (addr == 0xFF01 || addr == 0xFF02) {
-      serial.write(addr, val);
-      return;
-    }
-    if (addr >= 0xFF04 && addr <= 0xFF07) {
-      timer.write(addr, val);
-      return;
-    }
-    if (addr == 0xFF0F) {
-      interrupts.write_if(val);
-      return;
-    }
-    if (addr >= 0xFF10 && addr <= 0xFF3F) {
-      apu.write(addr, val);
-      return;
-    }
-    if (addr >= 0xFF40 && addr <= 0xFF4B) {
-      ppu.write(addr, val);
-      return;
-    }
-    if (addr < 0xFF80) {
-      io[addr - 0xFF00] = val;
-      return;
-    }
-    if (addr < 0xFFFF) { // High RAM / Zero Page ($FF80 - $FFFE)
-      hram[addr - 0xFF80] = val;
-      return;
-    }
-    interrupts.write_ie(val); // Interrupt Enable Register ($FFFF)
-  }
-};
 
 class SM83 {
 private:
   // State
-  bool is_on_halt = false;
+  bool is_on_halt;
 
   // Registers
   uint8_t reg_a; // Accumulator
@@ -906,16 +362,19 @@ public:
     // 3	Serial	0x58
     // 4	Joypad	0x60
 
-    const bool should_handle_interrupt = ((get_if() & get_ie()) > 0) && reg_ime;
+    uint8_t interrupt_flags = ((get_if() & get_ie() & 0x1F));
+    const bool should_handle_interrupt = (interrupt_flags > 0) && reg_ime;
+
+    if (interrupt_flags > 0) {
+      // Disable halting
+      is_on_halt = false;
+    }
 
     if (!should_handle_interrupt)
       return;
 
     // Disable interrupts for now...
     reg_ime = false;
-
-    // Disable halting
-    is_on_halt = false;
 
     uint8_t flags = get_if();
 
@@ -924,7 +383,7 @@ public:
       // Clear flag bit
       flags &= ~(1);
       write8(0xFF0F, flags);
-      tick(20);
+      tick(12);
       push(reg_pc);
       reg_pc = 0x40;
     }
@@ -935,7 +394,7 @@ public:
       flags &= ~(1 << 1);
 
       write8(0xFF0F, flags);
-      tick(20);
+      tick(12);
       push(reg_pc);
       reg_pc = 0x48;
     }
@@ -946,7 +405,7 @@ public:
       flags &= ~(1 << 2);
 
       write8(0xFF0F, flags);
-      tick(20);
+      tick(12);
       push(reg_pc);
       reg_pc = 0x50;
     }
@@ -957,7 +416,7 @@ public:
       flags &= ~(1 << 3);
 
       write8(0xFF0F, flags);
-      tick(20);
+      tick(12);
       push(reg_pc);
       reg_pc = 0x58;
     }
@@ -968,7 +427,7 @@ public:
       flags &= ~(1 << 4);
 
       write8(0xFF0F, flags);
-      tick(20);
+      tick(12);
       push(reg_pc);
       reg_pc = 0x60;
     }
@@ -1424,6 +883,7 @@ public:
   // Misc Control
   // Interrupt switches
   void ei() { // EI - enable interrupts (has a 1-instruction delay on real HW)
+    // TODO: Implement 1 instruction delay
     reg_ime = true;
   }
 
@@ -1442,6 +902,7 @@ public:
   // Decoder - fetch and execute a single instruction
   void execute() {
     if (is_on_halt) {
+      tick(4);
       return; // Skip execution
     }
 
@@ -2020,6 +1481,9 @@ public:
   }
 
   void boot() {
+    reg_ime = false;
+    is_on_halt = false;
+
     reg_sp = 0xFFFE;
     reg_pc = 0x0100;
     reg_a = 0x01;
@@ -2060,47 +1524,3 @@ public:
     std::cout << std::dec;
   }
 };
-
-// SM83 Emulator
-int main(int argc, char *argv[]) {
-  if (argc < 2) {
-    throw std::runtime_error("usage: sm83 <rom.gb>");
-  }
-
-  std::string filename = argv[1];
-
-  if (filename.empty()) {
-    throw std::runtime_error("provide a correct filename");
-  }
-
-  std::ifstream rom_file(filename, std::ios::binary | std::ios::ate);
-
-  if (!rom_file) {
-    throw std::runtime_error("error while opening rom file");
-  }
-
-  std::streamsize rom_size = rom_file.tellg();
-  rom_file.seekg(0, std::ios::beg);
-
-  std::vector<uint8_t> rom_buffer(rom_size);
-
-  rom_file.read(reinterpret_cast<char *>(rom_buffer.data()), rom_size);
-
-  std::cout << "Loaded ROM file of " << rom_size << " bytes...\n";
-
-  SM83 core{};
-
-  core.boot();
-  core.load_rom(rom_buffer);
-
-  uint64_t total = 0;
-  while (true) {
-    core.execute();
-    core.handle_interrupts();
-    if ((++total % (1000000)) == 0) {
-      core.debug_state();
-    }
-  }
-
-  return 0;
-}

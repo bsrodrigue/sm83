@@ -5,9 +5,7 @@
 #include <vector>
 
 #define private public
-#define main sm83_program_main
-#include "sm83.cpp"
-#undef main
+#include "sm83.hpp"
 #undef private
 
 namespace {
@@ -209,6 +207,41 @@ void test_timer() {
   CHECK((bus.read(0xFF0F) & 0x04) == 0x04);
 }
 
+void test_halt() {
+  SM83 c{};
+  load_program(c, 0x1000, {0x76, 0x3E, 0x42}); // HALT ; LD A, 0x42
+
+  c.write8(0xFFFF, 0x04); // Enable Timer interrupt in IE
+  c.write8(0xFF0F, 0x00); // Clear all IF flags
+  c.reg_ime = false;      // Disable master interrupts
+  c.reg_pc = 0x1000;
+  c.total_cycles = 0;
+
+  // 1. Execute HALT instruction
+  c.execute();
+  CHECK(c.is_on_halt == true);
+  CHECK(c.reg_pc == 0x1001); // HALT opcode was fetched
+
+  // 2. Subsequent execution while halted: PC stays fixed, 4 cycles elapse
+  c.execute();
+  CHECK(c.is_on_halt == true);
+  CHECK(c.reg_pc == 0x1001);
+  CHECK(c.total_cycles == 8); // 4 cycles for fetch8(HALT) + 4 idle cycles
+
+  // 3. Request Timer interrupt in IF (0x04)
+  c.bus.interrupts.request_interrupt(0x04);
+
+  // 4. Interrupt handler checks wakeup condition
+  c.handle_interrupts();
+  CHECK(c.is_on_halt == false); // HALT state cancelled!
+  CHECK(c.reg_pc == 0x1001);   // IME was false, so PC did not jump to vector
+
+  // 5. Next execute runs the instruction following HALT (LD A, 0x42)
+  c.execute();
+  CHECK(c.reg_a == 0x42);
+  CHECK(c.reg_pc == 0x1003);
+}
+
 } // namespace
 
 int main() {
@@ -219,6 +252,7 @@ int main() {
   test_interrupt_registers();
   test_bus_memory_map();
   test_timer();
+  test_halt();
 
   std::cout << "SM83 timing tests: " << g_checks << " checks, " << g_failures
             << " failures\n";
